@@ -2,6 +2,8 @@
 
 #![allow(clippy::large_enum_variant)]
 
+#[cfg(feature = "sparql-12")]
+use crate::MAX_NUMBER_OF_NESTED_TRIPLES;
 use crate::error::{QueryResultsParseError, QueryResultsSyntaxError};
 use json_event_parser::{JsonEvent, ReaderJsonParser, SliceJsonParser, WriterJsonSerializer};
 #[cfg(feature = "async-tokio")]
@@ -863,6 +865,8 @@ struct JsonInnerTermReader {
     predicate: Option<Term>,
     #[cfg(feature = "sparql-12")]
     object: Option<Term>,
+    #[cfg(feature = "sparql-12")]
+    depth: usize,
 }
 
 #[derive(Default)]
@@ -1150,10 +1154,19 @@ impl JsonInnerTermReader {
             #[cfg(feature = "sparql-12")]
             JsonInnerTermReaderState::InValue => match event {
                 JsonEvent::ObjectKey(object_key) => {
+                    if self.depth >= MAX_NUMBER_OF_NESTED_TRIPLES {
+                        return Err(QueryResultsSyntaxError::msg(
+                            "Too many nested triple terms. The parser fails here to avoid a stack overflow.",
+                        ));
+                    }
+                    let inner = Box::new(Self {
+                        depth: self.depth + 1,
+                        ..Self::default()
+                    });
                     self.state = match object_key.as_ref() {
-                        "subject" => JsonInnerTermReaderState::Subject(Box::default()),
-                        "predicate" => JsonInnerTermReaderState::Predicate(Box::default()),
-                        "object" => JsonInnerTermReaderState::Object(Box::default()),
+                        "subject" => JsonInnerTermReaderState::Subject(inner),
+                        "predicate" => JsonInnerTermReaderState::Predicate(inner),
+                        "object" => JsonInnerTermReaderState::Object(inner),
                         _ => {
                             return Err(QueryResultsSyntaxError::msg(format!(
                                 "Unsupported value key: {object_key}"
