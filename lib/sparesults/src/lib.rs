@@ -13,6 +13,10 @@ mod serializer;
 pub mod solution;
 mod xml;
 
+/// Maximal number of nested triple terms, the value of oxrdf's `MAX_NUMBER_OF_NESTED_TRIPLES`.
+/// Deeper triple terms overflow the stack when they are cloned, dropped or printed.
+const MAX_NUMBER_OF_NESTED_TRIPLES: usize = 128;
+
 pub use crate::error::{QueryResultsParseError, QueryResultsSyntaxError, TextPosition};
 pub use crate::format::QueryResultsFormat;
 pub use crate::parser::{
