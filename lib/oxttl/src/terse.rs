@@ -1,5 +1,7 @@
 //! Shared parser implementation for Turtle and TriG.
 
+#[cfg(feature = "rdf-12")]
+use crate::MAX_NUMBER_OF_NESTED_TRIPLES;
 use crate::lexer::{
     N3Lexer, N3LexerMode, N3LexerOptions, N3Token, resolve_local_name, to_lowercase,
 };
@@ -668,6 +670,13 @@ impl RuleRecognizer for TriGRecognizer {
                             .push(TriGState::ReifiedTripleSubject { is_reified: true });
                     }
                     #[cfg(feature = "rdf-12")]
+                    N3Token::Punctuation("<<(") if self.too_many_nested_triple_terms() => {
+                        self.error(
+                            errors,
+                            "Too many nested triple terms. The parser fails here to avoid a stack overflow.",
+                        );
+                    }
+                    #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("<<(") => {
                         self.stack.push(TriGState::TripleTermEnd { emit: true });
                         self.stack
@@ -1063,6 +1072,12 @@ impl RuleRecognizer for TriGRecognizer {
                         self.cur_object
                             .push(Literal::new_typed_literal("false", xsd::BOOLEAN).into());
                     }
+                    N3Token::Punctuation("<<(") if self.too_many_nested_triple_terms() => {
+                        self.error(
+                            errors,
+                            "Too many nested triple terms. The parser fails here to avoid a stack overflow.",
+                        );
+                    }
                     N3Token::Punctuation("<<(") => {
                         self.stack.push(TriGState::TripleTermEnd { emit: false });
                         self.stack
@@ -1170,6 +1185,15 @@ impl TriGRecognizer {
         self.cur_predicate.clear();
         self.cur_object.clear();
         self.cur_graph = GraphName::DefaultGraph;
+    }
+
+    #[cfg(feature = "rdf-12")]
+    fn too_many_nested_triple_terms(&self) -> bool {
+        self.stack
+            .iter()
+            .filter(|s| matches!(s, TriGState::TripleTermEnd { .. }))
+            .count()
+            >= MAX_NUMBER_OF_NESTED_TRIPLES
     }
 
     fn emit_quad(&mut self, results: &mut Vec<Quad>) {

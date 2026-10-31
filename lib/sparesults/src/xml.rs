@@ -1,5 +1,6 @@
 //! Implementation of [SPARQL Query Results XML Format](https://www.w3.org/TR/rdf-sparql-XMLres/)
 
+use crate::MAX_NUMBER_OF_NESTED_TRIPLES;
 use crate::error::{QueryResultsParseError, QueryResultsSyntaxError};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::*;
@@ -839,6 +840,18 @@ impl XmlInnerSolutionsParser {
                             self.state_stack.push(State::Literal);
                             Ok(None)
                         } else if event.local_name().into_inner() == "triple" {
+                            if self
+                                .state_stack
+                                .iter()
+                                .filter(|s| matches!(s, State::Triple))
+                                .count()
+                                >= MAX_NUMBER_OF_NESTED_TRIPLES
+                            {
+                                return Err(QueryResultsSyntaxError::msg(
+                                    "Too many nested triple terms. The parser fails here to avoid a stack overflow.",
+                                )
+                                .into());
+                            }
                             self.state_stack.push(State::Triple);
                             Ok(None)
                         } else {
