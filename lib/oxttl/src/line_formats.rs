@@ -1,5 +1,7 @@
 //! Shared parser implementation for N-Triples and N-Quads.
 
+#[cfg(feature = "rdf-12")]
+use crate::MAX_NUMBER_OF_NESTED_TRIPLES;
 use crate::lexer::{N3Lexer, N3LexerMode, N3LexerOptions, N3Token};
 use crate::toolkit::{Lexer, Parser, RuleRecognizer, RuleRecognizerError, TokenOrLineJump};
 use crate::{MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
@@ -147,6 +149,23 @@ impl RuleRecognizer for NQuadsRecognizer {
                         self.stack
                             .push(NQuadsState::ExpectLiteralAnnotationOrGraphNameOrDot { value });
                         self
+                    }
+                    #[cfg(feature = "rdf-12")]
+                    N3Token::Punctuation("<<(")
+                        if self
+                            .stack
+                            .iter()
+                            .filter(|s| matches!(s, NQuadsState::AfterQuotedTriple))
+                            .count()
+                            >= MAX_NUMBER_OF_NESTED_TRIPLES =>
+                    {
+                        self.error(
+                            context,
+                            results,
+                            errors,
+                            TokenOrLineJump::Token(token),
+                            "Too many nested triple terms. The parser fails here to avoid a stack overflow.",
+                        )
                     }
                     #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("<<(") => {
