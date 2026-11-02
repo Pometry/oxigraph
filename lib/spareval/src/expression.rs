@@ -11,7 +11,7 @@ use oxrdf::{BlankNode, Literal, NamedNode, Term, Variable};
 use oxsdatatypes::{Date, DayTimeDuration, Duration, Time, TimezoneOffset, YearMonthDuration};
 use oxsdatatypes::{DateTime, Decimal, Double, Float, Integer};
 use rand::random;
-use regex::{Regex, RegexBuilder};
+use regex::{Captures, Regex, RegexBuilder, Replacer};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 use spargebra::algebra::Function;
@@ -707,6 +707,11 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                         } else {
                             language = Some(e_language)
                         }
+                        if result.len() + value.len()
+                            > MAX_STRING_LENGTH.max(result.len()).max(value.len())
+                        {
+                            return None;
+                        }
                         result += &value
                     }
                     Some(build_plain_literal(result, language.flatten()))
@@ -762,10 +767,7 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             return None;
                         };
                         Some(build_plain_literal(
-                            match regex.replace_all(&text, &replacement) {
-                                Cow::Owned(replaced) => replaced,
-                                Cow::Borrowed(_) => text,
-                            },
+                            replace_all(&regex, text, &replacement)?,
                             language,
                         ))
                     })
@@ -793,10 +795,7 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             return None;
                         };
                         Some(build_plain_literal(
-                            match regex.replace_all(&text, &replacement) {
-                                Cow::Owned(replaced) => replaced,
-                                Cow::Borrowed(_) => text,
-                            },
+                            replace_all(&regex, text, &replacement)?,
                             language,
                         ))
                     })
@@ -851,6 +850,9 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                                 });
                             }
                         }
+                    }
+                    if result.len() > MAX_STRING_LENGTH.max(ltlr.len()) {
+                        return None;
                     }
                     Some(ExpressionTerm::StringLiteral(
                         String::from_utf8(result).ok()?,
@@ -1285,7 +1287,18 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                 let p = build_expression_evaluator(&parameters[1], context)?;
                 let o = build_expression_evaluator(&parameters[2], context)?;
                 Rc::new(move |tuple| {
-                    Some(ExpressionTriple::new(s(tuple)?, p(tuple)?, o(tuple)?)?.into())
+                    let o = o(tuple)?;
+                    // As the parsers: a deeper term would overflow the stack when it is dropped or serialized
+                    let mut nested = 0;
+                    let mut object = &o;
+                    while let ExpressionTerm::Triple(triple) = object {
+                        nested += 1;
+                        object = &triple.object;
+                    }
+                    if nested >= MAX_NUMBER_OF_NESTED_TRIPLES {
+                        return None;
+                    }
+                    Some(ExpressionTriple::new(s(tuple)?, p(tuple)?, o)?.into())
                 })
             }
             #[cfg(feature = "sparql-12")]
@@ -1687,6 +1700,50 @@ fn to_string_and_language(
         ExpressionTerm::LangStringLiteral { value, language } => Some((value, Some(language))),
         _ => None,
     }
+}
+
+/// Maximal length in bytes of a string built by CONCAT, REPLACE, GROUP_CONCAT or ENCODE_FOR_URI, as oxttl's
+/// MAX_BUFFER_SIZE for a token: their results can be inputs again, so their lengths multiply.
+/// A longer input is kept as it is, but nothing grows past it.
+pub(crate) const MAX_STRING_LENGTH: usize = 4096 * 4096;
+
+/// Maximal number of nested triple terms, the value of oxrdf's `MAX_NUMBER_OF_NESTED_TRIPLES`.
+#[cfg(feature = "sparql-12")]
+const MAX_NUMBER_OF_NESTED_TRIPLES: usize = 128;
+
+/// `Regex::replace_all` that fails rather than build a string over `MAX_STRING_LENGTH` or the text
+fn replace_all(regex: &Regex, text: String, replacement: &str) -> Option<String> {
+    struct CappedReplacer<'a> {
+        replacement: &'a str,
+        references: usize,
+        limit: usize,
+        too_long: bool,
+    }
+    impl Replacer for CappedReplacer<'_> {
+        fn replace_append(&mut self, caps: &Captures<'_>, dst: &mut String) {
+            // each `$` reference expands to at most the whole match
+            let matched = caps.get(0).map_or(0, |m| m.len());
+            if self.too_long
+                || dst.len() + self.replacement.len() + self.references * matched > self.limit
+            {
+                self.too_long = true;
+            } else {
+                caps.expand(self.replacement, dst);
+            }
+        }
+    }
+    let limit = MAX_STRING_LENGTH.max(text.len());
+    let mut replacer = CappedReplacer {
+        replacement,
+        references: replacement.matches('$').count(),
+        limit,
+        too_long: false,
+    };
+    let replaced = match regex.replace_all(&text, replacer.by_ref()) {
+        Cow::Owned(replaced) => replaced,
+        Cow::Borrowed(_) => return Some(text),
+    };
+    (!replacer.too_long && replaced.len() <= limit).then_some(replaced)
 }
 
 #[cfg(feature = "sparql-12")]

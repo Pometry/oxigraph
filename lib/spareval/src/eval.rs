@@ -3,8 +3,9 @@ use crate::dataset::ExpressionTriple;
 use crate::dataset::{ExpressionTerm, InternalQuad, QueryableDataset};
 use crate::error::QueryEvaluationError;
 use crate::expression::{
-    CustomFunctionRegistry, ExpressionEvaluator, ExpressionEvaluatorContext, NumericBinaryOperands,
-    build_expression_evaluator, partial_cmp_literals, try_build_internal_expression_evaluator,
+    CustomFunctionRegistry, ExpressionEvaluator, ExpressionEvaluatorContext, MAX_STRING_LENGTH,
+    NumericBinaryOperands, build_expression_evaluator, partial_cmp_literals,
+    try_build_internal_expression_evaluator,
 };
 use crate::model::{QuerySolutionIter, QueryTripleIter};
 use crate::service::ServiceHandlerRegistry;
@@ -2641,6 +2642,16 @@ impl Accumulator for GroupConcatAccumulator {
             self.concat = None;
             return;
         };
+        // The separator goes before every value but the first
+        let separator = if self.language.is_some() {
+            self.separator.len()
+        } else {
+            0
+        };
+        if concat.len() + separator + value.len() > MAX_STRING_LENGTH.max(value.len()) {
+            self.concat = None;
+            return;
+        }
         if let Some(lang) = &self.language {
             if *lang != e_language {
                 self.language = Some(None)
