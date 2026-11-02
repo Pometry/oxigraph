@@ -103,7 +103,6 @@ pub fn infer_graph_pattern_types(
             variables,
             aggregates,
         } => {
-            let types = infer_graph_pattern_types(inner, types);
             VariableTypes {
                 inner: infer_graph_pattern_types(inner, types)
                     .inner
