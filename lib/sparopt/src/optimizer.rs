@@ -15,7 +15,10 @@ pub struct Optimizer;
 impl Optimizer {
     pub fn optimize_graph_pattern(pattern: GraphPattern) -> GraphPattern {
         let pattern = Self::normalize_pattern(pattern, &VariableTypes::default());
-        let pattern = Self::reorder_joins(pattern, &VariableTypes::default());
+        // trying a lateral join reorders the right side of an OPTIONAL a second time, doubling the work below it
+        let mut lateral_attempts = 64;
+        let pattern =
+            Self::reorder_joins(pattern, &VariableTypes::default(), &mut lateral_attempts);
         Self::push_filters(pattern, Vec::new(), &VariableTypes::default())
     }
 
@@ -499,7 +502,12 @@ impl Optimizer {
         }
     }
 
-    fn reorder_joins(pattern: GraphPattern, input_types: &VariableTypes) -> GraphPattern {
+    #[cfg_attr(not(feature = "sep-0006"), expect(clippy::only_used_in_recursion))]
+    fn reorder_joins(
+        pattern: GraphPattern,
+        input_types: &VariableTypes,
+        budget: &mut usize,
+    ) -> GraphPattern {
         match pattern {
             GraphPattern::QuadPattern { .. }
             | GraphPattern::Path { .. }
@@ -514,7 +522,7 @@ impl Optimizer {
                         todo.push(*right);
                         todo.push(*left);
                     } else {
-                        to_reorder.push(Self::reorder_joins(e, input_types));
+                        to_reorder.push(Self::reorder_joins(e, input_types, budget));
                     }
                 }
 
@@ -647,8 +655,8 @@ impl Optimizer {
             GraphPattern::Lateral { left, right } => {
                 let left_types = infer_graph_pattern_types(&left, input_types.clone());
                 GraphPattern::lateral(
-                    Self::reorder_joins(*left, input_types),
-                    Self::reorder_joins(*right, &left_types),
+                    Self::reorder_joins(*left, input_types, budget),
+                    Self::reorder_joins(*right, &left_types, budget),
                 )
             }
             GraphPattern::LeftJoin {
@@ -657,7 +665,7 @@ impl Optimizer {
                 expression,
                 ..
             } => {
-                let left = Self::reorder_joins(*left, input_types);
+                let left = Self::reorder_joins(*left, input_types, budget);
                 let left_types = infer_graph_pattern_types(&left, input_types.clone());
                 #[cfg(feature = "sep-0006")]
                 {
@@ -674,9 +682,10 @@ impl Optimizer {
                                 1_000_usize.saturating_pow(keys.len().try_into().unwrap()),
                             );
 
-                        if lateral_cost <= join_cost.saturating_mul(100) {
+                        if lateral_cost <= join_cost.saturating_mul(100) && *budget > 0 {
+                            *budget -= 1;
                             let right_for_lateral =
-                                Self::reorder_joins((*right).clone(), &left_types);
+                                Self::reorder_joins((*right).clone(), &left_types, budget);
                             if is_fit_for_for_loop_join(
                                 &right_for_lateral,
                                 input_types,
@@ -697,7 +706,7 @@ impl Optimizer {
                         }
                     }
                 }
-                let right = Self::reorder_joins(*right, input_types);
+                let right = Self::reorder_joins(*right, input_types, budget);
                 let right_types = infer_graph_pattern_types(&right, input_types.clone());
                 GraphPattern::left_join(
                     left,
@@ -709,9 +718,9 @@ impl Optimizer {
                 )
             }
             GraphPattern::Minus { left, right, .. } => {
-                let left = Self::reorder_joins(*left, input_types);
+                let left = Self::reorder_joins(*left, input_types, budget);
                 let left_types = infer_graph_pattern_types(&left, input_types.clone());
-                let right = Self::reorder_joins(*right, input_types);
+                let right = Self::reorder_joins(*right, input_types, budget);
                 let right_types = infer_graph_pattern_types(&right, input_types.clone());
                 GraphPattern::minus(
                     left,
@@ -726,34 +735,38 @@ impl Optimizer {
                 expression,
                 variable,
             } => GraphPattern::extend(
-                Self::reorder_joins(*inner, input_types),
+                Self::reorder_joins(*inner, input_types, budget),
                 variable,
                 expression,
             ),
             GraphPattern::Filter { inner, expression } => {
-                GraphPattern::filter(Self::reorder_joins(*inner, input_types), expression)
+                GraphPattern::filter(Self::reorder_joins(*inner, input_types, budget), expression)
             }
             GraphPattern::Union { inner } => GraphPattern::union_all(
                 inner
                     .into_iter()
-                    .map(|c| Self::reorder_joins(c, input_types)),
+                    .map(|c| Self::reorder_joins(c, input_types, budget)),
             ),
             GraphPattern::Slice {
                 inner,
                 start,
                 length,
-            } => GraphPattern::slice(Self::reorder_joins(*inner, input_types), start, length),
+            } => GraphPattern::slice(
+                Self::reorder_joins(*inner, input_types, budget),
+                start,
+                length,
+            ),
             GraphPattern::Distinct { inner } => {
-                GraphPattern::distinct(Self::reorder_joins(*inner, input_types))
+                GraphPattern::distinct(Self::reorder_joins(*inner, input_types, budget))
             }
             GraphPattern::Reduced { inner } => {
-                GraphPattern::reduced(Self::reorder_joins(*inner, input_types))
+                GraphPattern::reduced(Self::reorder_joins(*inner, input_types, budget))
             }
             GraphPattern::Project { inner, variables } => {
-                GraphPattern::project(Self::reorder_joins(*inner, input_types), variables)
+                GraphPattern::project(Self::reorder_joins(*inner, input_types, budget), variables)
             }
             GraphPattern::OrderBy { inner, expression } => {
-                GraphPattern::order_by(Self::reorder_joins(*inner, input_types), expression)
+                GraphPattern::order_by(Self::reorder_joins(*inner, input_types, budget), expression)
             }
             GraphPattern::Service { .. } => {
                 // We don't do join reordering inside of SERVICE calls, we don't know about cardinalities
@@ -764,7 +777,7 @@ impl Optimizer {
                 variables,
                 aggregates,
             } => GraphPattern::group(
-                Self::reorder_joins(*inner, input_types),
+                Self::reorder_joins(*inner, input_types, budget),
                 variables,
                 aggregates,
             ),
@@ -1078,49 +1091,68 @@ fn estimate_triple_pattern_size(
 }
 
 fn estimate_path_size(start_bound: bool, path: &PropertyPathExpression, end_bound: bool) -> usize {
+    estimate_path_sizes(path)[usize::from(start_bound)][usize::from(end_bound)]
+}
+
+/// The size estimates for each `[start_bound][end_bound]`, computed in one pass:
+/// a sequence needs two of them from each side, so computing one at a time is exponential.
+fn estimate_path_sizes(path: &PropertyPathExpression) -> [[usize; 2]; 2] {
+    let each = |estimate: &dyn Fn(usize, usize) -> usize| {
+        [
+            [estimate(0, 0), estimate(0, 1)],
+            [estimate(1, 0), estimate(1, 1)],
+        ]
+    };
     match path {
         PropertyPathExpression::NamedNode(_) => {
-            estimate_triple_pattern_size(start_bound, true, end_bound)
+            each(&|s, e| estimate_triple_pattern_size(s == 1, true, e == 1))
         }
-        PropertyPathExpression::Reverse(p) => estimate_path_size(end_bound, p, start_bound),
+        PropertyPathExpression::Reverse(p) => {
+            let p = estimate_path_sizes(p);
+            each(&|s, e| p[e][s])
+        }
         PropertyPathExpression::Sequence(a, b) => {
+            let (a, b) = (estimate_path_sizes(a), estimate_path_sizes(b));
             // We do a for loop join in the best direction
-            min(
-                estimate_path_size(start_bound, a, false)
-                    .saturating_mul(estimate_path_size(true, b, end_bound)),
-                estimate_path_size(start_bound, a, true)
-                    .saturating_mul(estimate_path_size(false, b, end_bound)),
-            )
+            each(&|s, e| {
+                min(
+                    a[s][0].saturating_mul(b[1][e]),
+                    a[s][1].saturating_mul(b[0][e]),
+                )
+            })
         }
-        PropertyPathExpression::Alternative(a, b) => estimate_path_size(start_bound, a, end_bound)
-            .saturating_add(estimate_path_size(start_bound, b, end_bound)),
+        PropertyPathExpression::Alternative(a, b) => {
+            let (a, b) = (estimate_path_sizes(a), estimate_path_sizes(b));
+            each(&|s, e| a[s][e].saturating_add(b[s][e]))
+        }
         PropertyPathExpression::ZeroOrMore(p) => {
-            if start_bound && end_bound {
-                1
-            } else if start_bound || end_bound {
-                estimate_path_size(start_bound, p, end_bound).saturating_mul(1000)
-            } else {
-                1_000_000_000
-            }
+            let p = estimate_path_sizes(p);
+            each(&|s, e| match (s, e) {
+                (1, 1) => 1,
+                (0, 0) => 1_000_000_000,
+                _ => p[s][e].saturating_mul(1000),
+            })
         }
         PropertyPathExpression::OneOrMore(p) => {
-            if start_bound && end_bound {
-                1
-            } else {
-                estimate_path_size(start_bound, p, end_bound).saturating_mul(1000)
-            }
+            let p = estimate_path_sizes(p);
+            each(&|s, e| {
+                if (s, e) == (1, 1) {
+                    1
+                } else {
+                    p[s][e].saturating_mul(1000)
+                }
+            })
         }
         PropertyPathExpression::ZeroOrOne(p) => {
-            if start_bound && end_bound {
-                1
-            } else if start_bound || end_bound {
-                estimate_path_size(start_bound, p, end_bound)
-            } else {
-                1_000_000_000
-            }
+            let p = estimate_path_sizes(p);
+            each(&|s, e| match (s, e) {
+                (1, 1) => 1,
+                (0, 0) => 1_000_000_000,
+                _ => p[s][e],
+            })
         }
         PropertyPathExpression::NegatedPropertySet(_) => {
-            estimate_triple_pattern_size(start_bound, false, end_bound)
+            each(&|s, e| estimate_triple_pattern_size(s == 1, false, e == 1))
         }
     }
 }
@@ -1142,5 +1174,48 @@ fn is_named_node_pattern_bound(pattern: &NamedNodePattern, input_types: &Variabl
     match pattern {
         NamedNodePattern::NamedNode(_) => true,
         NamedNodePattern::Variable(v) => !input_types.get(v).undef,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxrdf::NamedNode;
+
+    #[test]
+    fn nested_path_sequences_are_estimated_once() {
+        let p = PropertyPathExpression::NamedNode(NamedNode::new_unchecked("http://e/p"));
+        let sequence = |a, b| PropertyPathExpression::Sequence(Box::new(a), Box::new(b));
+        // from the bound start: 10 then 10, rather than 1 (both bound) then 1,000,000
+        assert_eq!(
+            estimate_path_size(true, &sequence(p.clone(), p.clone()), false),
+            100
+        );
+        // each level took both estimates of both sides: 2^40 calls
+        let path = (0..40).fold(p.clone(), |a, _| sequence(a, p.clone()));
+        std::hint::black_box(estimate_path_size(true, &path, false));
+    }
+
+    #[test]
+    fn nested_queries_are_planned_once() {
+        // each level inferred the types of the pattern of its GROUP twice: 2^40 calls
+        let groups = (0..40).fold("?s <http://e/p> ?o".to_owned(), |inner, i| {
+            format!("SELECT (COUNT(*) AS ?c{i}) WHERE {{ {inner} }}")
+        });
+        // each level reordered the right side of its OPTIONAL twice
+        let optionals = (0..40).rev().fold(String::new(), |inner, i| {
+            format!(
+                "?v{i} <http://e/p> ?v{} OPTIONAL {{ SELECT * WHERE {{ {inner} }} }}",
+                i + 1
+            )
+        });
+        for query in [groups, format!("SELECT * WHERE {{ {optionals} }}")] {
+            let spargebra::Query::Select { pattern, .. } =
+                spargebra::SparqlParser::new().parse_query(&query).unwrap()
+            else {
+                unreachable!()
+            };
+            std::hint::black_box(Optimizer::optimize_graph_pattern((&pattern).into()));
+        }
     }
 }
