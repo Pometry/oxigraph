@@ -122,6 +122,10 @@ impl<'a, D: QueryableDataset<'a>> EvalDataset<'a, D> {
         graph_name: Option<Option<&D::InternalTerm>>,
     ) -> Box<dyn Iterator<Item = Result<InternalQuad<D::InternalTerm>, QueryEvaluationError>> + 'a>
     {
+        // The lookup might not return any quad, so checking the cancellation on each returned quad is not enough
+        if let Err(error) = self.cancellation_token.ensure_alive() {
+            return Box::new(once(Err(error)));
+        }
         if let Some(graph_name) = graph_name {
             // A graph (named or default), has been specified, we only query it
             if let Some(graph_name) = graph_name {
@@ -1225,6 +1229,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         let probe = right;
                         if keys.is_empty() {
                             // Cartesian product
+                            let cancellation_token = self.dataset.cancellation_token.clone();
                             Rc::new(move |from| {
                                 let mut errors = Vec::default();
                                 let built_values = build(from.clone())
@@ -1249,6 +1254,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                     probe_iter,
                                     built: built_values,
                                     buffered_results: errors,
+                                    cancellation_token: cancellation_token.clone(),
                                 })
                             })
                         } else {
@@ -3754,6 +3760,7 @@ struct CartesianProductJoinIterator<'a, T> {
     probe_iter: Peekable<InternalTuplesIterator<'a, T>>,
     built: Vec<InternalTuple<T>>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
@@ -3768,6 +3775,11 @@ impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
                 Ok(probe_tuple) => probe_tuple,
                 Err(error) => return Some(Err(error)),
             };
+            // This loop might produce a lot of tuples without calling any other operator, so we check the cancellation here,
+            // once per probe tuple so that the iterator still ends
+            if let Err(error) = self.cancellation_token.ensure_alive() {
+                return Some(Err(error));
+            }
             for built_tuple in &self.built {
                 if let Some(result_tuple) = probe_tuple.combine_with(built_tuple) {
                     self.buffered_results.push(Ok(result_tuple))

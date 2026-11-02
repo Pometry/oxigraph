@@ -1317,4 +1317,70 @@ mod tests {
             .explain(&Dataset::new());
         assert!(format!("{explanation:?}").contains("Filter("));
     }
+
+    #[test]
+    fn cancellation_without_returned_quads() {
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+        let dataset = Dataset::new();
+        for query in [
+            "SELECT * WHERE { VALUES ?x { 1 2 3 } VALUES ?y { 1 2 } }",
+            "SELECT * WHERE { VALUES ?s { <http://example.com/s> } ?s <http://example.com/p> ?o }",
+            "SELECT * WHERE { VALUES ?s { <http://example.com/s> } OPTIONAL { ?s <http://example.com/p> ?o } }",
+        ] {
+            let query = SparqlParser::new().parse_query(query).unwrap();
+            let results = QueryEvaluator::new()
+                .with_cancellation_token(cancellation_token.clone())
+                .prepare(&query)
+                .execute(&dataset);
+            let error = match results {
+                Ok(QueryResults::Solutions(solutions)) => {
+                    solutions.collect::<Result<Vec<_>, _>>().unwrap_err()
+                }
+                Ok(_) => unreachable!(),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, QueryEvaluationError::Cancelled),
+                "{query}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_during_a_cartesian_product() {
+        let values = (0..1000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let product =
+            format!("VALUES ?x {{ {values} }} VALUES ?y {{ {values} }} VALUES ?z {{ {values} }}");
+        let dataset = Dataset::new();
+        // 10^9 solutions: without a check inside the product this runs for minutes
+        for query in [
+            format!("SELECT * WHERE {{ {product} }}"),
+            // an aggregate reads every error its input returns, so the product must still end
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ {product} }}"),
+        ] {
+            let query = SparqlParser::new().parse_query(&query).unwrap();
+            let cancellation_token = CancellationToken::new();
+            let canceller = cancellation_token.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                canceller.cancel();
+            });
+            let Ok(QueryResults::Solutions(mut solutions)) = QueryEvaluator::new()
+                .with_cancellation_token(cancellation_token)
+                .prepare(&query)
+                .execute(&dataset)
+            else {
+                unreachable!()
+            };
+            assert!(matches!(
+                solutions.find_map(Result::err),
+                Some(QueryEvaluationError::Cancelled)
+            ));
+            timer.join().unwrap();
+        }
+    }
 }
