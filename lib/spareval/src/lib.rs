@@ -1355,13 +1355,24 @@ mod tests {
             .join(" ");
         let product =
             format!("VALUES ?x {{ {values} }} VALUES ?y {{ {values} }} VALUES ?z {{ {values} }}");
+        // 10^10 solutions joined on ?k, as a hash join or a for loop over VALUES
+        let rows = (0..100)
+            .map(|i| format!("(1 {i})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let join = (0..5)
+            .map(|j| format!("VALUES (?k ?x{j}) {{ {rows} }} "))
+            .collect::<Vec<_>>()
+            .concat();
         let dataset = Dataset::new();
         // 10^9 solutions: without a check inside the product this runs for minutes
-        for query in [
-            format!("SELECT * WHERE {{ {product} }}"),
-            // an aggregate reads every error its input returns, so the product must still end
-            format!("SELECT (COUNT(*) AS ?n) WHERE {{ {product} }}"),
-        ] {
+        for query in [&product, &join].into_iter().flat_map(|pattern| {
+            [
+                format!("SELECT * WHERE {{ {pattern} }}"),
+                // an aggregate reads every error its input returns, so the join must still end
+                format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} }}"),
+            ]
+        }) {
             let query = SparqlParser::new().parse_query(&query).unwrap();
             let cancellation_token = CancellationToken::new();
             let canceller = cancellation_token.clone();
