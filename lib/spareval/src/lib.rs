@@ -1093,7 +1093,7 @@ impl fmt::Debug for QueryExplanation {
 mod tests {
     use super::*;
     use oxrdf::vocab::xsd;
-    use oxrdf::{Dataset, Literal, Term};
+    use oxrdf::{Dataset, GraphNameRef, Literal, NamedNode, QuadRef, Term};
     use spargebra::SparqlParser;
     use sparopt::algebra::{Expression, GraphPattern};
 
@@ -1382,5 +1382,126 @@ mod tests {
             ));
             timer.join().unwrap();
         }
+    }
+
+    #[test]
+    fn built_strings_are_capped() {
+        let length = |query: String| {
+            let query = SparqlParser::new().parse_query(&query).unwrap();
+            let dataset = Dataset::new();
+            let Ok(QueryResults::Solutions(mut solutions)) =
+                QueryEvaluator::new().prepare(&query).execute(&dataset)
+            else {
+                unreachable!()
+            };
+            solutions.next().unwrap().unwrap().get("l").cloned()
+        };
+        let cap = Some(Literal::from(1 << 24).into());
+        // each REPLACE makes the string 16 times longer: 16^6 bytes is the cap
+        let replace = |n: usize, replacement: &str| {
+            format!(
+                "{}\"a\"{}",
+                "REPLACE(".repeat(n),
+                format!(", \"(a)\", \"{replacement}\")").repeat(n)
+            )
+        };
+        let length_of =
+            |expression: String| length(format!("SELECT (STRLEN({expression}) AS ?l) {{}}"));
+        assert_eq!(length_of(replace(6, &"a".repeat(16))), cap);
+        assert_eq!(length_of(replace(7, &"a".repeat(16))), None);
+        assert_eq!(length_of(replace(7, &"$1".repeat(16))), None);
+        let concat = (0..40)
+            .map(|i| format!("BIND(CONCAT(?v{i}, ?v{i}) AS ?v{}) ", i + 1))
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(
+            length(format!(
+                "SELECT (STRLEN(?v40) AS ?l) {{ BIND(\"a\" AS ?v0) {concat} }}"
+            )),
+            None
+        );
+        // 1 MiB per row
+        let group_concat = |rows: usize| {
+            length(format!(
+                "SELECT (STRLEN(GROUP_CONCAT(?s; SEPARATOR=\"\")) AS ?l) {{ VALUES ?x {{ {} }} BIND({} AS ?s) }}",
+                (0..rows)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                replace(5, &"a".repeat(16))
+            ))
+        };
+        assert_eq!(group_concat(16), cap);
+        assert_eq!(group_concat(17), None);
+        // ENCODE_FOR_URI makes a space three bytes
+        let spaces = |n: usize| format!("REPLACE({}, \"a\", \" \")", replace(n, &"a".repeat(16)));
+        assert_eq!(
+            length_of(format!("ENCODE_FOR_URI({})", spaces(5))),
+            Some(Literal::from(3 << 20).into())
+        );
+        assert_eq!(length_of(format!("ENCODE_FOR_URI({})", spaces(6))), None);
+    }
+
+    #[test]
+    fn strings_over_the_cap_are_kept() {
+        let mut dataset = Dataset::new();
+        let s = NamedNode::new_unchecked("http://e/s");
+        let long = Literal::new_simple_literal("a".repeat((1 << 24) + 1));
+        dataset.insert(QuadRef::new(
+            s.as_ref(),
+            s.as_ref(),
+            long.as_ref(),
+            GraphNameRef::DefaultGraph,
+        ));
+        let length = |expression: &str| {
+            let query = SparqlParser::new()
+                .parse_query(&format!(
+                    "SELECT (STRLEN({expression}) AS ?l) {{ ?s ?p ?o }}"
+                ))
+                .unwrap();
+            let Ok(QueryResults::Solutions(mut solutions)) =
+                QueryEvaluator::new().prepare(&query).execute(&dataset)
+            else {
+                unreachable!()
+            };
+            solutions.next().unwrap().unwrap().get("l").cloned()
+        };
+        let long = Some(Literal::from((1 << 24) + 1).into());
+        assert_eq!(length("CONCAT(?o)"), long);
+        assert_eq!(length("CONCAT(?o, \"\")"), long);
+        assert_eq!(length("REPLACE(?o, \"b\", \"\")"), long);
+        assert_eq!(length("REPLACE(?o, \"a\", \"b\")"), long);
+        assert_eq!(length("ENCODE_FOR_URI(?o)"), long);
+        assert_eq!(length("CONCAT(?o, \"a\")"), None);
+        assert_eq!(length("REPLACE(?o, \"a\", \"bb\")"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "sparql-12")]
+    fn built_triple_terms_are_capped() {
+        let binds = (0..129)
+            .map(|i| {
+                format!(
+                    "BIND(<<( <http://e/s> <http://e/p> ?t{i} )>> AS ?t{}) ",
+                    i + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        let query = SparqlParser::new()
+            .parse_query(&format!(
+                "SELECT ?t128 ?t129 {{ BIND(<http://e/o> AS ?t0) {binds} }}"
+            ))
+            .unwrap();
+        let dataset = Dataset::new();
+        let Ok(QueryResults::Solutions(mut solutions)) =
+            QueryEvaluator::new().prepare(&query).execute(&dataset)
+        else {
+            unreachable!()
+        };
+        let solution = solutions.next().unwrap().unwrap();
+        // 128 nested triple terms, as the parsers accept, and not one more
+        assert!(solution.get("t128").is_some());
+        assert!(solution.get("t129").is_none());
     }
 }
