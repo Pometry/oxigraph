@@ -126,7 +126,13 @@ impl SparqlParser {
         );
         #[cfg(feature = "standard-unicode-escaping")]
         let query = unescape_unicode_codepoints(query);
-        Ok(parser::QueryUnit(&query, &mut state).map_err(SparqlSyntaxErrorKind::Syntax)?)
+        let query = parser::QueryUnit(&query, &mut state).map_err(|e| state.syntax_error(e))?;
+        let (Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. }) = &query;
+        check_depth(pattern)?;
+        Ok(query)
     }
 
     /// Parse the given update string using the already set options.
@@ -152,8 +158,13 @@ impl SparqlParser {
         #[cfg(feature = "standard-unicode-escaping")]
         let update = unescape_unicode_codepoints(update);
         let operations =
-            parser::UpdateInit(&update, &mut state).map_err(SparqlSyntaxErrorKind::Syntax)?;
+            parser::UpdateInit(&update, &mut state).map_err(|e| state.syntax_error(e))?;
         check_if_insert_data_are_sharing_blank_nodes(&operations)?;
+        for operation in &operations {
+            if let GraphUpdateOperation::DeleteInsert { pattern, .. } = operation {
+                check_depth(pattern)?;
+            }
+        }
         Ok(Update {
             operations,
             base_iri: state.base_iri,
@@ -183,6 +194,8 @@ enum SparqlSyntaxErrorKind {
     Syntax(#[from] peg::error::ParseError<LineCol>),
     #[error("The blank node {0} cannot be shared by multiple blocks")]
     SharedBlankNode(BlankNode),
+    #[error("{0}")]
+    TooDeep(&'static str),
 }
 
 #[cfg(feature = "standard-unicode-escaping")]
@@ -571,15 +584,200 @@ fn new_join(l: GraphPattern, r: GraphPattern) -> GraphPattern {
     }
 }
 
-fn not_empty_fold<T>(
-    iter: impl Iterator<Item = T>,
-    combine: impl Fn(T, T) -> T,
-) -> Result<T, &'static str> {
-    iter.fold(None, |a, b| match a {
-        Some(av) => Some(combine(av, b)),
-        None => Some(b),
-    })
-    .ok_or("The iterator should not be empty")
+/// Maximal number of nested groups, expressions, property paths, blank node property lists,
+/// collections, annotations, reified triples and triple terms.
+/// The parser recurses on each of them, so a deeper query would overflow the stack.
+const MAX_NESTING: usize = 256;
+const TOO_NESTED: &str =
+    "The query has more than 256 nested groups, expressions, property paths or triple terms";
+
+/// Maximal depth of the algebra of a query, as counted by `pattern_depth`.
+/// The optimizer and the evaluator recurse over the algebra, so a deeper one would overflow the stack.
+const MAX_DEPTH: usize = 512;
+const TOO_DEEP: &str = "The query algebra is more than 512 levels deep";
+
+fn check_depth(pattern: &GraphPattern) -> Result<(), SparqlSyntaxError> {
+    if pattern_depth(pattern) > MAX_DEPTH {
+        return Err(SparqlSyntaxErrorKind::TooDeep(TOO_DEEP).into());
+    }
+    Ok(())
+}
+
+/// The depth of the algebra the optimizer and the evaluator recurse over.
+/// A basic graph pattern counts its triple patterns and a join adds up its sides,
+/// since the optimizer turns them into a chain of joins.
+fn pattern_depth(pattern: &GraphPattern) -> usize {
+    match pattern {
+        GraphPattern::Bgp { patterns } => patterns.len(),
+        GraphPattern::Path { path, .. } => 1 + path_depth(path),
+        GraphPattern::Join { left, right } => pattern_depth(left) + pattern_depth(right),
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            1 + pattern_depth(left)
+                .max(pattern_depth(right))
+                .max(expression.as_ref().map_or(0, expression_depth))
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => 1 + pattern_depth(left).max(pattern_depth(right)),
+        GraphPattern::Union { left, right } | GraphPattern::Minus { left, right } => {
+            1 + pattern_depth(left).max(pattern_depth(right))
+        }
+        GraphPattern::Filter { expr, inner }
+        | GraphPattern::Extend {
+            inner,
+            expression: expr,
+            ..
+        } => 1 + pattern_depth(inner).max(expression_depth(expr)),
+        GraphPattern::Graph { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Service { inner, .. } => 1 + pattern_depth(inner),
+        GraphPattern::Values { .. } => 1,
+        GraphPattern::OrderBy { inner, expression } => {
+            // the optimizer binds each condition that is not a variable on top of the previous one
+            let bound = expression
+                .iter()
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        OrderExpression::Asc(Expression::Variable(_))
+                            | OrderExpression::Desc(Expression::Variable(_))
+                    )
+                })
+                .count();
+            1 + bound
+                + expression
+                    .iter()
+                    .map(|e| match e {
+                        OrderExpression::Asc(e) | OrderExpression::Desc(e) => expression_depth(e),
+                    })
+                    .fold(pattern_depth(inner), usize::max)
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            1 + aggregates
+                .iter()
+                .map(|(_, a)| match a {
+                    AggregateExpression::CountSolutions { .. } => 0,
+                    AggregateExpression::FunctionCall { expr, .. } => expression_depth(expr),
+                })
+                .fold(pattern_depth(inner), usize::max)
+        }
+    }
+}
+
+fn expression_depth(expression: &Expression) -> usize {
+    1 + match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => 0,
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => expression_depth(a).max(expression_depth(b)),
+        Expression::In(a, l) => l
+            .iter()
+            .map(expression_depth)
+            .fold(expression_depth(a), usize::max),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
+            expression_depth(a)
+        }
+        Expression::Exists(p) => pattern_depth(p),
+        Expression::If(a, b, c) => expression_depth(a)
+            .max(expression_depth(b))
+            .max(expression_depth(c)),
+        Expression::Coalesce(l) | Expression::FunctionCall(_, l) => {
+            l.iter().map(expression_depth).max().unwrap_or(0)
+        }
+    }
+}
+
+/// Maximal number of terms the optimizer builds for an `IN` expression, as counted by `expanded_size`.
+const MAX_IN_SIZE: usize = 1 << 16;
+const TOO_LARGE_IN: &str = "An IN expression expands to more than 65536 terms";
+
+/// The number of terms the optimizer builds for the expression: it repeats the left side of `IN` for each item.
+fn expanded_size(expression: &Expression) -> usize {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_)
+        | Expression::Exists(_) => 1,
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => expanded_size(a)
+            .saturating_add(expanded_size(b))
+            .saturating_add(1),
+        Expression::In(a, l) => l.iter().map(expanded_size).fold(
+            expanded_size(a).saturating_mul(l.len().max(1)),
+            usize::saturating_add,
+        ),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
+            expanded_size(a).saturating_add(1)
+        }
+        Expression::If(a, b, c) => expanded_size(a)
+            .saturating_add(expanded_size(b))
+            .saturating_add(expanded_size(c))
+            .saturating_add(1),
+        Expression::Coalesce(l) | Expression::FunctionCall(_, l) => {
+            l.iter().map(expanded_size).fold(1, usize::saturating_add)
+        }
+    }
+}
+
+fn path_depth(path: &PropertyPathExpression) -> usize {
+    1 + match path {
+        PropertyPathExpression::NamedNode(_) | PropertyPathExpression::NegatedPropertySet(_) => 0,
+        PropertyPathExpression::Reverse(p)
+        | PropertyPathExpression::ZeroOrMore(p)
+        | PropertyPathExpression::OneOrMore(p)
+        | PropertyPathExpression::ZeroOrOne(p) => path_depth(p),
+        PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
+            path_depth(a).max(path_depth(b))
+        }
+    }
+}
+
+/// Combines a chain of an associative operator into a balanced tree,
+/// so a long chain does not make the algebra deep.
+fn balanced_fold<T>(mut items: Vec<T>, combine: impl Fn(T, T) -> T) -> Result<T, &'static str> {
+    while items.len() > 1 {
+        let mut pairs = Vec::with_capacity(items.len().div_ceil(2));
+        let mut items_iter = items.into_iter();
+        while let Some(a) = items_iter.next() {
+            pairs.push(match items_iter.next() {
+                Some(b) => combine(a, b),
+                None => a,
+            });
+        }
+        items = pairs;
+    }
+    items.pop().ok_or("The iterator should not be empty")
 }
 
 #[derive(Default)]
@@ -627,8 +825,10 @@ fn build_select(
         group = Some((vec![], vec![]));
     }
 
+    let mut depth = pattern_depth(&p);
     if let Some((clauses, binds)) = group {
         for (expression, variable) in binds {
+            depth = state.checked_depth(1 + depth.max(expression_depth(&expression)))?;
             p = GraphPattern::Extend {
                 inner: Box::new(p),
                 variable,
@@ -686,6 +886,8 @@ fn build_select(
                                 "The SELECT contains an expression with a variable that is unbound",
                             );
                         }
+                        depth =
+                            state.checked_depth(1 + depth.max(expression_depth(&expression)))?;
                         p = GraphPattern::Extend {
                             inner: Box::new(p),
                             variable: variable.clone(),
@@ -939,6 +1141,9 @@ pub struct ParserState {
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
+    nesting: usize,
+    /// The limit the parse ran into and the furthest offset of a syntax error it explains
+    limit: Option<(&'static str, usize)>,
 }
 
 impl ParserState {
@@ -954,6 +1159,30 @@ impl ParserState {
             used_bnodes: HashSet::new(),
             currently_used_bnodes: HashSet::new(),
             aggregates: Vec::new(),
+            nesting: 0,
+            limit: None,
+        }
+    }
+
+    fn checked_depth(&mut self, depth: usize) -> Result<usize, &'static str> {
+        if depth <= MAX_DEPTH {
+            Ok(depth)
+        } else {
+            // a too deep algebra is an error whatever else fails
+            self.limit = Some((TOO_DEEP, usize::MAX));
+            Err(TOO_DEEP)
+        }
+    }
+
+    fn syntax_error(&self, error: peg::error::ParseError<LineCol>) -> SparqlSyntaxErrorKind {
+        // peg reports the furthest failure, which `i()` may put a keyword past where the limit was hit
+        match self.limit {
+            Some((limit, at))
+                if error.location.offset <= at.saturating_add("ENCODE_FOR_URI".len()) =>
+            {
+                SparqlSyntaxErrorKind::TooDeep(limit)
+            }
+            _ => SparqlSyntaxErrorKind::Syntax(error),
         }
     }
 
@@ -1056,6 +1285,25 @@ parser! {
         }
 
         pub rule UpdateInit() -> Vec<GraphUpdateOperation> = Update()
+
+        // A nested rule is `nesting_enter() v:(Rule_inner() / nesting_undo()) nesting_leave()`,
+        // so the count is undone when the rule fails.
+        rule nesting_enter() = at:position!() {?
+            if state.nesting < MAX_NESTING {
+                state.nesting += 1;
+                Ok(())
+            } else {
+                // a query at the limit tries deeper rules that fail, so this is an error only where the parse stops
+                if state.limit.is_none_or(|(_, furthest)| furthest < at) {
+                    state.limit = Some((TOO_NESTED, at));
+                }
+                Err(TOO_NESTED)
+            }
+        }
+        rule nesting_leave() = { state.nesting -= 1; }
+        // Fails without a syntax error; `[_]` is never reached and only tells peg that it consumes input.
+        rule nesting_undo<T>() -> T = quiet!{ nesting_undo_count() [_] { unreachable!() } }
+        rule nesting_undo_count() = {? state.nesting -= 1; Err("") }
 
         rule Prologue() = (BaseDecl() _ / PrefixDecl() _ / VersionDecl() _)* {}
 
@@ -1224,7 +1472,7 @@ parser! {
         rule GroupCondition_as() -> Variable = i("AS") _ v:Var() _ { v }
 
         rule HavingClause() -> Expression = i("HAVING") _ e:HavingCondition()+ {?
-            not_empty_fold(e.into_iter(), |a, b| Expression::And(Box::new(a), Box::new(b)))
+            balanced_fold(e, |a, b| Expression::And(Box::new(a), Box::new(b)))
         }
 
         rule HavingCondition() -> Expression = c:Constraint() _ { c }
@@ -1320,6 +1568,7 @@ parser! {
         }
 
         rule DeleteWhere() -> Vec<GraphUpdateOperation> = i("DELETE") _ i("WHERE") _ d:QuadPattern() {?
+            state.checked_depth(d.len())?;
             let pattern = d.iter().map(|q| {
                 let bgp = GraphPattern::Bgp { patterns: vec![TriplePattern::new(q.subject.clone(), q.predicate.clone(), q.object.clone())] };
                 match &q.graph_name {
@@ -1466,7 +1715,8 @@ parser! {
         }
         // Keep this group's filters separate until OPTIONAL has extracted its condition.
         // A filter in a nested group must remain inside that nested group.
-        rule GroupGraphPatternWithFilters() -> (GraphPattern, Option<Expression>) =
+        rule GroupGraphPatternWithFilters() -> (GraphPattern, Option<Expression>) = nesting_enter() v:(GroupGraphPatternWithFilters_inner() / nesting_undo()) nesting_leave() { v }
+        rule GroupGraphPatternWithFilters_inner() -> (GraphPattern, Option<Expression>) =
             "{" _ GroupGraphPattern_clear() p:GroupGraphPatternSub() GroupGraphPattern_clear() _ "}" { p } /
             "{" _ GroupGraphPattern_clear() p:SubSelect() GroupGraphPattern_clear() _ "}" { (p, None) }
         rule GroupGraphPattern_clear() = {
@@ -1476,9 +1726,21 @@ parser! {
         }
 
         rule GroupGraphPatternSub() -> (GraphPattern, Option<Expression>) = a:TriplesBlock()? _ b:GroupGraphPatternSub_item()* {?
-            let mut filter: Option<Expression> = None;
+            let mut filters = Vec::new();
             let mut g = a.map_or_else(GraphPattern::default, build_bgp);
+            let mut depth = pattern_depth(&g);
             for e in b.into_iter().flatten() {
+                depth = state.checked_depth(match &e {
+                    PartialGraphPattern::Optional(p, f) => {
+                        1 + depth.max(pattern_depth(p)).max(f.as_ref().map_or(0, expression_depth))
+                    }
+                    #[cfg(feature = "sep-0006")]
+                    PartialGraphPattern::Lateral(p) => 1 + depth.max(pattern_depth(p)),
+                    PartialGraphPattern::Minus(p) => 1 + depth.max(pattern_depth(p)),
+                    PartialGraphPattern::Bind(expression, _) => 1 + depth.max(expression_depth(expression)),
+                    PartialGraphPattern::Filter(_) => depth,
+                    PartialGraphPattern::Other(p) => depth + pattern_depth(p),
+                })?;
                 match e {
                     PartialGraphPattern::Optional(p, f) => {
                         g = GraphPattern::LeftJoin { left: Box::new(g), right: Box::new(p), expression: f }
@@ -1513,14 +1775,15 @@ parser! {
                         }
                         g = GraphPattern::Extend { inner: Box::new(g), variable, expression }
                     }
-                    PartialGraphPattern::Filter(expr) => filter = Some(if let Some(f) = filter {
-                        Expression::And(Box::new(f), Box::new(expr))
-                    } else {
-                        expr
-                    }),
+                    PartialGraphPattern::Filter(expr) => filters.push(expr),
                     PartialGraphPattern::Other(e) => g = new_join(g, e),
                 }
             }
+            let filter = if filters.is_empty() {
+                None
+            } else {
+                Some(balanced_fold(filters, |a, b| Expression::And(Box::new(a), Box::new(b)))?)
+            };
 
             Ok((g, filter))
         }
@@ -1532,8 +1795,11 @@ parser! {
             result
         }
 
-        rule TriplesBlock() -> Vec<TripleOrPathPattern> = hs:TriplesBlock_inner() ++ (".") ("." _)? {
-            hs.into_iter().flatten().collect()
+        rule TriplesBlock() -> Vec<TripleOrPathPattern> = hs:TriplesBlock_inner() ++ (".") ("." _)? {?
+            // each pattern adds a level to the join chain the block becomes
+            let patterns: Vec<_> = hs.into_iter().flatten().collect();
+            state.checked_depth(patterns.len())?;
+            Ok(patterns)
         }
         rule TriplesBlock_inner() -> Vec<TripleOrPathPattern> = _ h:TriplesSameSubjectPath() _ { h }
 
@@ -1554,6 +1820,7 @@ parser! {
             for (p, os) in po.focus {
                 for o in os {
                     add_to_triple_or_path_patterns(s.focus.clone(), p.clone(), o, &mut patterns)?;
+                    state.checked_depth(patterns.len())?;
                 }
             }
             Ok(patterns)
@@ -1629,7 +1896,7 @@ parser! {
         }
 
         rule GroupOrUnionGraphPattern() -> PartialGraphPattern = p:GroupOrUnionGraphPattern_item() **<1,> (i("UNION") _) {?
-            not_empty_fold(p.into_iter(), |a, b| {
+            balanced_fold(p, |a, b| {
                 GraphPattern::Union { left: Box::new(a), right: Box::new(b) }
             }).map(PartialGraphPattern::Other)
         }
@@ -1641,11 +1908,13 @@ parser! {
 
         rule Constraint() -> Expression = BrackettedExpression() / FunctionCall() / BuiltInCall()
 
-        rule FunctionCall() -> Expression = f:iri() _ a:ArgList() {?
+        rule FunctionCall() -> Expression = f:FunctionName() _ a:ArgList() { Expression::FunctionCall(Function::Custom(f), a) }
+        // checked before the arguments, so an aggregate's arguments are not parsed again as a function call's
+        rule FunctionName() -> NamedNode = f:iri() {?
             if state.custom_aggregate_functions.contains(&f) {
                 Err("This custom function is an aggregate function and not a regular function")
             } else {
-                Ok(Expression::FunctionCall(Function::Custom(f), a))
+                Ok(f)
             }
         }
 
@@ -1742,6 +2011,7 @@ parser! {
                 for (p, os) in po.focus {
                     for o in os {
                         add_to_triple_or_path_patterns(s.clone(), p.clone(), o, &mut patterns)?;
+                        state.checked_depth(patterns.len())?;
                     }
                 }
                 Ok(patterns)
@@ -1752,6 +2022,7 @@ parser! {
                 for (p, os) in po.focus {
                     for o in os {
                         add_to_triple_or_path_patterns(s.focus.clone(), p.clone(), o, &mut patterns)?;
+                        state.checked_depth(patterns.len())?;
                     }
                 }
                 Ok(patterns)
@@ -1810,17 +2081,17 @@ parser! {
             }
         }
 
-        rule Path() -> PropertyPathExpression = PathAlternative()
+        rule Path() -> PropertyPathExpression = nesting_enter() v:(PathAlternative() / nesting_undo()) nesting_leave() { v }
 
         rule PathAlternative() -> PropertyPathExpression = p:PathAlternative_item() **<1,> ("|" _) {?
-            not_empty_fold(p.into_iter(), |a, b| {
+            balanced_fold(p, |a, b| {
                 PropertyPathExpression::Alternative(Box::new(a), Box::new(b))
             })
         }
         rule PathAlternative_item() -> PropertyPathExpression = p:PathSequence() _ { p }
 
         rule PathSequence() -> PropertyPathExpression = p:PathSequence_item() **<1,> ("/" _) {?
-            not_empty_fold(p.into_iter(), |a, b| {
+            balanced_fold(p, |a, b| {
                 PropertyPathExpression::Sequence(Box::new(a), Box::new(b))
             })
         }
@@ -1909,6 +2180,7 @@ parser! {
             for (p, os) in po.focus {
                 for o in os {
                     add_to_triple_or_path_patterns(bnode.clone(), p.clone(), o, &mut patterns)?;
+                    state.checked_depth(patterns.len())?;
                 }
             }
             Ok(FocusedTripleOrPathPattern {
@@ -1979,6 +2251,7 @@ parser! {
                     for (p, os) in annotations.focus {
                         for o in os {
                             add_to_triple_or_path_patterns(output.focus.clone(), p.clone(), o, &mut output.patterns)?;
+                            state.checked_depth(output.patterns.len())?;
                         }
                     }
                     output.patterns.extend(annotations.patterns);
@@ -1990,13 +2263,15 @@ parser! {
                 for (p, os) in a.focus {
                     for o in os {
                         add_to_triple_or_path_patterns(output.focus.clone(), p.clone(), o, &mut output.patterns)?;
+                        state.checked_depth(output.patterns.len())?;
                     }
                 }
                 output.patterns.extend(a.patterns);
                 Ok(output)
             }
 
-        rule AnnotationBlockPath() -> FocusedTripleOrPathPattern<Vec<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = "{|" _ a:PropertyListPathNotEmpty() _ "|}" { a }
+        rule AnnotationBlockPath() -> FocusedTripleOrPathPattern<Vec<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = nesting_enter() v:(AnnotationBlockPath_inner() / nesting_undo()) nesting_leave() { v }
+        rule AnnotationBlockPath_inner() -> FocusedTripleOrPathPattern<Vec<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = "{|" _ a:PropertyListPathNotEmpty() _ "|}" { a }
 
         rule Annotation() -> FocusedTriplePattern<Vec<TermPattern>> = a:Annotation_e()* {
             let mut output: FocusedTriplePattern<Vec<TermPattern>> = FocusedTriplePattern::new(Vec::new());
@@ -2030,19 +2305,23 @@ parser! {
                 Ok(output)
             }
 
-        rule AnnotationBlock() -> FocusedTriplePattern<Vec<(NamedNodePattern,Vec<ReifiedTerm>)>> = "{|" _ a:PropertyListNotEmpty() _ "|}" { a }
+        rule AnnotationBlock() -> FocusedTriplePattern<Vec<(NamedNodePattern,Vec<ReifiedTerm>)>> = nesting_enter() v:(AnnotationBlock_inner() / nesting_undo()) nesting_leave() { v }
+        rule AnnotationBlock_inner() -> FocusedTriplePattern<Vec<(NamedNodePattern,Vec<ReifiedTerm>)>> = "{|" _ a:PropertyListNotEmpty() _ "|}" { a }
 
-        rule GraphNode() -> FocusedTriplePattern<TermPattern> =
+        rule GraphNode() -> FocusedTriplePattern<TermPattern> = nesting_enter() v:(GraphNode_inner() / nesting_undo()) nesting_leave() { v }
+        rule GraphNode_inner() -> FocusedTriplePattern<TermPattern> =
             ReifiedTriple() /
             t:VarOrTerm() { FocusedTriplePattern::new(t) } /
             TriplesNode()
 
-        rule GraphNodePath() -> FocusedTripleOrPathPattern<TermPattern> =
+        rule GraphNodePath() -> FocusedTripleOrPathPattern<TermPattern> = nesting_enter() v:(GraphNodePath_inner() / nesting_undo()) nesting_leave() { v }
+        rule GraphNodePath_inner() -> FocusedTripleOrPathPattern<TermPattern> =
             t:ReifiedTriple() { t.into() } /
             t:VarOrTerm() { FocusedTripleOrPathPattern::new(t) } /
             TriplesNodePath()
 
-        rule ReifiedTriple() -> FocusedTriplePattern<TermPattern> = "<<" _ s:ReifiedTripleSubject() _ p:Verb() _ o:ReifiedTripleObject() _ r:Reifier()? _ ">>" {?
+        rule ReifiedTriple() -> FocusedTriplePattern<TermPattern> = nesting_enter() v:(ReifiedTriple_inner() / nesting_undo()) nesting_leave() { v }
+        rule ReifiedTriple_inner() -> FocusedTriplePattern<TermPattern> = "<<" _ s:ReifiedTripleSubject() _ p:Verb() _ o:ReifiedTripleObject() _ r:Reifier()? _ ">>" {?
             #[cfg(feature = "sparql-12")]
             {
                 let r = r.unwrap_or_else(|| BlankNode::default().into());
@@ -2081,7 +2360,8 @@ parser! {
             l:BooleanLiteral() { FocusedTriplePattern::new(l) } /
             b:BlankNode() { FocusedTriplePattern::new(b) }
 
-        rule TripleTerm() -> TriplePattern = "<<(" _ s:TripleTermSubject() _ p:Verb() _ o:TripleTermObject() _ ")>>" {
+        rule TripleTerm() -> TriplePattern = nesting_enter() v:(TripleTerm_inner() / nesting_undo()) nesting_leave() { v }
+        rule TripleTerm_inner() -> TriplePattern = "<<(" _ s:TripleTermSubject() _ p:Verb() _ o:TripleTermObject() _ ")>>" {
             TriplePattern {
                 subject: s,
                 predicate: p,
@@ -2103,7 +2383,8 @@ parser! {
             l:BooleanLiteral() { l.into() } /
             b:BlankNode() { b.into() }
 
-        rule TripleTermData() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ p:TripleTermData_p() _ o:TripleTermDataObject() _ ")>>" {?
+        rule TripleTermData() -> GroundTriple = nesting_enter() v:(TripleTermData_inner() / nesting_undo()) nesting_leave() { v }
+        rule TripleTermData_inner() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ p:TripleTermData_p() _ o:TripleTermDataObject() _ ")>>" {?
             Ok(GroundTriple {
                 subject: if let GroundTerm::NamedNode(s) = s { s } else { return Err("Literals or triple terms are not allowed in subject position of nested patterns") },
                 predicate: p,
@@ -2130,21 +2411,28 @@ parser! {
 
         rule Var() -> Variable = name:(VAR1() / VAR2()) { Variable::new_unchecked(name) }
 
-        rule Expression() -> Expression = e:ConditionalOrExpression() {e}
+        rule Expression() -> Expression = nesting_enter() v:(ConditionalOrExpression() / nesting_undo()) nesting_leave() { v }
 
         rule ConditionalOrExpression() -> Expression = e:ConditionalOrExpression_item() **<1,> ("||" _) {?
-            not_empty_fold(e.into_iter(), |a, b| Expression::Or(Box::new(a), Box::new(b)))
+            balanced_fold(e, |a, b| Expression::Or(Box::new(a), Box::new(b)))
         }
         rule ConditionalOrExpression_item() -> Expression = e:ConditionalAndExpression() _ { e }
 
         rule ConditionalAndExpression() -> Expression = e:ConditionalAndExpression_item() **<1,> ("&&" _) {?
-            not_empty_fold(e.into_iter(), |a, b| Expression::And(Box::new(a), Box::new(b)))
+            balanced_fold(e, |a, b| Expression::And(Box::new(a), Box::new(b)))
         }
         rule ConditionalAndExpression_item() -> Expression = e:ValueLogical() _ { e }
 
         rule ValueLogical() -> Expression = RelationalExpression()
 
-        rule RelationalExpression() -> Expression = a:NumericExpression() _ o: RelationalExpression_inner()? { match o {
+        rule RelationalExpression() -> Expression = a:NumericExpression() _ o: RelationalExpression_inner()? {?
+            if let Some((_, None, Some(l))) = &o {
+                if expanded_size(&a).saturating_mul(l.len()) > MAX_IN_SIZE {
+                    state.limit = Some((TOO_LARGE_IN, usize::MAX));
+                    return Err(TOO_LARGE_IN);
+                }
+            }
+            Ok(match o {
             Some(("=", Some(b), None)) => Expression::Equal(Box::new(a), Box::new(b)),
             Some(("!=", Some(b), None)) => Expression::Not(Box::new(Expression::Equal(Box::new(a), Box::new(b)))),
             Some((">", Some(b), None)) => Expression::Greater(Box::new(a), Box::new(b)),
@@ -2155,7 +2443,7 @@ parser! {
             Some(("NOT IN", None, Some(l))) => Expression::Not(Box::new(Expression::In(Box::new(a), l))),
             Some(_) => unreachable!(),
             None => a
-        } }
+        }) }
         rule RelationalExpression_inner() -> (&'input str, Option<Expression>, Option<Vec<Expression>>) =
             s: $("="  / "!=" / ">=" / ">" / "<=" / "<") _ e:NumericExpression() { (s, Some(e), None) } /
             i("IN") _ l:ExpressionList() { ("IN", None, Some(l)) } /
@@ -2163,29 +2451,37 @@ parser! {
 
         rule NumericExpression() -> Expression = AdditiveExpression()
 
-        rule AdditiveExpression() -> Expression = a:MultiplicativeExpression() _ o:AdditiveExpression_inner()* {
-            o.into_iter().fold(a, |a, (operator, b)| match operator {
-                "+" => Expression::Add(Box::new(a), Box::new(b)),
-                "-" => Expression::Subtract(Box::new(a), Box::new(b)),
-                _ => unreachable!(),
+        rule AdditiveExpression() -> Expression = a:MultiplicativeExpression() _ o:AdditiveExpression_inner()* {?
+            let mut depth = expression_depth(&a);
+            o.into_iter().try_fold(a, |a, (operator, b)| {
+                depth = state.checked_depth(1 + depth.max(expression_depth(&b)))?;
+                Ok(match operator {
+                    "+" => Expression::Add(Box::new(a), Box::new(b)),
+                    "-" => Expression::Subtract(Box::new(a), Box::new(b)),
+                    _ => unreachable!(),
+                })
             })
         }
         rule AdditiveExpression_inner() -> (&'input str, Expression) = s: $("+" / "-") _ e:MultiplicativeExpression() _ {
             (s, e)
         }
 
-        rule MultiplicativeExpression() -> Expression = a:UnaryExpression() _ o:MultiplicativeExpression_inner()* {
-            o.into_iter().fold(a, |a, (operator, b)| match operator {
-                "*" => Expression::Multiply(Box::new(a), Box::new(b)),
-                "/" => Expression::Divide(Box::new(a), Box::new(b)),
-                _ => unreachable!(),
+        rule MultiplicativeExpression() -> Expression = a:UnaryExpression() _ o:MultiplicativeExpression_inner()* {?
+            let mut depth = expression_depth(&a);
+            o.into_iter().try_fold(a, |a, (operator, b)| {
+                depth = state.checked_depth(1 + depth.max(expression_depth(&b)))?;
+                Ok(match operator {
+                    "*" => Expression::Multiply(Box::new(a), Box::new(b)),
+                    "/" => Expression::Divide(Box::new(a), Box::new(b)),
+                    _ => unreachable!(),
+                })
             })
         }
         rule MultiplicativeExpression_inner() -> (&'input str, Expression) = s: $("*" / "/") _ e:UnaryExpression() _ {
             (s, e)
         }
 
-        rule UnaryExpression() -> Expression = s: "!" _ e:UnaryExpression() {?
+        rule UnaryExpression() -> Expression = s: "!" _ &['!' | '+' | '-'] nesting_enter() e:(UnaryExpression() / nesting_undo()) nesting_leave() {?
             #[cfg(feature = "sparql-12")]{Ok(Expression::Not(Box::new(e)))}
             #[cfg(not(feature = "sparql-12"))]{Err("Double negation (!!) is only available in SPARQL 1.2")}
         } / s: $("!" / "+" / "-")? _ e:PrimaryExpression() { match s {
@@ -2206,7 +2502,8 @@ parser! {
             l:BooleanLiteral() { l.into() } /
             BuiltInCall()
 
-        rule ExprTripleTerm() -> Expression = "<<(" _ s:ExprTripleTermSubject() _ p:Verb() _ o:ExprTripleTermObject() _ ")>>" {?
+        rule ExprTripleTerm() -> Expression = nesting_enter() v:(ExprTripleTerm_inner() / nesting_undo()) nesting_leave() { v }
+        rule ExprTripleTerm_inner() -> Expression = "<<(" _ s:ExprTripleTermSubject() _ p:Verb() _ o:ExprTripleTermObject() _ ")>>" {?
             #[cfg(feature = "sparql-12")]{Ok(Expression::FunctionCall(Function::Triple, vec![s, p.into(), o]))}
             #[cfg(not(feature = "sparql-12"))]{Err("Triple terms are only available in SPARQL 1.2")}
         }
@@ -2320,56 +2617,48 @@ parser! {
             }
 
         rule RegexExpression() -> Expression =
-            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::Regex, vec![a, b, c]) } /
-            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ ")" { Expression::FunctionCall(Function::Regex, vec![a, b]) }
+            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ c:("," _ c:Expression() _ { c })? ")" { Expression::FunctionCall(Function::Regex, [a, b].into_iter().chain(c).collect()) }
 
 
         rule SubstringExpression() -> Expression =
-            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::SubStr, vec![a, b, c]) } /
-            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ ")" { Expression::FunctionCall(Function::SubStr, vec![a, b]) }
+            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ c:("," _ c:Expression() _ { c })? ")" { Expression::FunctionCall(Function::SubStr, [a, b].into_iter().chain(c).collect()) }
 
 
         rule StrReplaceExpression() -> Expression =
-            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ "," _ d:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c, d]) } /
-            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c]) }
+            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ d:("," _ d:Expression() _ { d })? ")" { Expression::FunctionCall(Function::Replace, [a, b, c].into_iter().chain(d).collect()) }
 
         rule ExistsFunc() -> Expression = i("EXISTS") _ p:GroupGraphPattern() { Expression::Exists(Box::new(p)) }
 
         rule NotExistsFunc() -> Expression = i("NOT") _ i("EXISTS") _ p:GroupGraphPattern() { Expression::Not(Box::new(Expression::Exists(Box::new(p)))) }
 
         rule Aggregate() -> AggregateExpression =
-            i("COUNT") _ "(" _ i("DISTINCT") _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: true } } /
-            i("COUNT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: true } } /
+            i("COUNT") _ "(" _ DISTINCT() _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: true } } /
+            i("COUNT") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: true } } /
             i("COUNT") _ "(" _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: false } } /
             i("COUNT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: false } } /
-            i("SUM") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: true } } /
+            i("SUM") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: true } } /
             i("SUM") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: false } } /
-            i("MIN") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: true } } /
+            i("MIN") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: true } } /
             i("MIN") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: false } } /
-            i("MAX") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: true } } /
+            i("MAX") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: true } } /
             i("MAX") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: false } } /
-            i("AVG") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: true } } /
+            i("AVG") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: true } } /
             i("AVG") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: false } } /
-            i("SAMPLE") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: true } } /
+            i("SAMPLE") _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: true } } /
             i("SAMPLE") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
-            name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
-                if state.custom_aggregate_functions.contains(&name) {
-                    Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true })
-                } else {
-                    Err("This custom function is a regular function and not an aggregate function")
-                }
-            } /
-            name:iri() _ "(" _ expr:Expression() _ ")" {?
-                if state.custom_aggregate_functions.contains(&name) {
-                    Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false })
-                } else {
-                    Err("This custom function is a regular function and not an aggregate function")
-                }
+            i("GROUP_CONCAT") _ "(" _ distinct:(DISTINCT() _)? expr:Expression() _ separator:(";" _ i("SEPARATOR") _ "=" _ s:String() _ { s })? ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator }, expr, distinct: distinct.is_some() } } /
+            name:CustomAggregateName() _ "(" _ DISTINCT() _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            name:CustomAggregateName() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } }
+        // checked before the arguments, so a function call's arguments are not parsed again as an aggregate's
+        rule CustomAggregateName() -> NamedNode = name:iri() {?
+            if state.custom_aggregate_functions.contains(&name) {
+                Ok(name)
+            } else {
+                Err("This custom function is a regular function and not an aggregate function")
             }
+        }
+        // not the start of a prefixed name such as `distinct:x`
+        rule DISTINCT() = i("DISTINCT") !(PN_CHARS()* ("."+ PN_CHARS()+)* ":")
 
         rule iriOrFunction() -> Expression = i: iri() _ a: ArgList()? {?
             if let Some(a) = a {
@@ -2570,5 +2859,216 @@ parser! {
                 Err(literal)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a debug build recurses on far bigger frames, so the deep queries run on a big stack
+    #[expect(clippy::unwrap_in_result)]
+    fn parse(query: String) -> Result<Query, String> {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                SparqlParser::new()
+                    .parse_query(&query)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn nesting_limit() {
+        let groups = |n: usize| parse(format!("SELECT * WHERE {}{}", "{".repeat(n), "}".repeat(n)));
+        groups(256).unwrap();
+        assert!(groups(257).unwrap_err().contains(TOO_NESTED));
+        // FILTER's own brackets and the group are two of the 256
+        let brackets = |n: usize| {
+            parse(format!(
+                "ASK {{ FILTER({}true{}) }}",
+                "(".repeat(n),
+                ")".repeat(n)
+            ))
+        };
+        brackets(254).unwrap();
+        assert!(brackets(255).unwrap_err().contains(TOO_NESTED));
+    }
+
+    #[test]
+    fn depth_limit() {
+        let optionals = |n: usize| {
+            format!(
+                "WHERE {{ ?s ?p ?o {} }}",
+                "OPTIONAL { ?s ?p ?o } ".repeat(n)
+            )
+        };
+        parse(format!("SELECT * {}", optionals(510))).unwrap();
+        assert!(
+            parse(format!("SELECT * {}", optionals(511)))
+                .unwrap_err()
+                .contains(TOO_DEEP)
+        );
+        // without the projection of a SELECT
+        let update = SparqlParser::new()
+            .parse_update(&format!("DELETE {{ ?s ?p ?o }} {}", optionals(512)))
+            .unwrap_err();
+        assert!(update.to_string().contains(TOO_DEEP));
+        // the optimizer joins the triple patterns of a basic graph pattern one after the other
+        let bgp = |n: usize| {
+            parse(format!(
+                "SELECT * WHERE {{ {} }}",
+                (0..n)
+                    .map(|i| format!("?x{i} ?p ?x{} . ", i + 1))
+                    .collect::<Vec<_>>()
+                    .concat()
+            ))
+        };
+        bgp(511).unwrap();
+        assert!(bgp(512).unwrap_err().contains(TOO_DEEP));
+    }
+
+    #[test]
+    fn long_associative_chains_are_balanced() {
+        // parsed on the test thread's own stack
+        for query in [
+            format!("SELECT * WHERE {{ {{}} {} }}", "UNION {} ".repeat(10_000)),
+            format!("ASK {{ FILTER(true{}) }}", " && true".repeat(10_000)),
+            format!("ASK {{ FILTER(false{}) }}", " || false".repeat(10_000)),
+            format!(
+                "ASK {{ ?s (<http://e/p>{})+ ?o }}",
+                "|<http://e/p>".repeat(10_000)
+            ),
+            format!(
+                "ASK {{ ?s (<http://e/p>{})+ ?o }}",
+                "/<http://e/p>".repeat(10_000)
+            ),
+            format!("ASK {{ ?s ?p ?o {} }}", "FILTER(true) ".repeat(10_000)),
+        ] {
+            SparqlParser::new().parse_query(&query).unwrap();
+        }
+    }
+
+    #[test]
+    fn nested_calls_are_parsed_once() {
+        // parsing the arguments once per alternative took 2^30 steps
+        for (open, close) in [
+            ("REGEX(", ", \"a\")"),
+            ("SUBSTR(", ", 1)"),
+            ("REPLACE(", ", \"a\", \"b\")"),
+            ("GROUP_CONCAT(", ")"),
+            ("!(", ")"),
+        ] {
+            parse(format!(
+                "SELECT ({}\"a\"{} AS ?x) WHERE {{}}",
+                open.repeat(30),
+                close.repeat(30)
+            ))
+            .unwrap();
+        }
+        // so does parsing a function call's arguments again as a custom aggregate's
+        let filters = |inner: &str| {
+            format!(
+                "ASK {{ {}{inner}{} }}",
+                "FILTER <http://e/f>(EXISTS { ".repeat(30),
+                " })".repeat(30)
+            )
+        };
+        parse(filters("FILTER <http://e/f>(1)")).unwrap();
+        parse(filters("FILTER <http://e/f>(1 1)")).unwrap_err();
+        // and parsing `distinct:f(` both as a prefixed name and as DISTINCT `:f(`
+        parse(format!(
+            "PREFIX : <http://e/> PREFIX distinct: <http://e/> SELECT ({}1 1{} AS ?x) {{}}",
+            "COUNT(distinct:f(".repeat(30),
+            "))".repeat(30)
+        ))
+        .unwrap_err();
+    }
+
+    #[test]
+    fn distinct_is_a_keyword_only_before_a_separator() {
+        let distinct = |aggregate: &str| {
+            parse(format!(
+                "PREFIX distinctive: <http://e/> SELECT ({aggregate} AS ?x) {{}}"
+            ))
+            .unwrap()
+            .to_string()
+            .contains("(DISTINCT ")
+        };
+        assert!(!distinct("GROUP_CONCAT(distinctive:label)"));
+        assert!(!distinct("COUNT(distinctive:label)"));
+        assert!(distinct("GROUP_CONCAT(DISTINCT ?x)"));
+        assert!(distinct("GROUP_CONCAT(DISTINCT?x)"));
+        assert!(distinct("SUM(distinct ?x)"));
+    }
+
+    #[test]
+    #[cfg(feature = "sparql-12")]
+    fn negation_of_a_unary_expression() {
+        for query in [
+            "ASK { FILTER(!-?x) }",
+            "ASK { FILTER(!+?x) }",
+            "ASK { FILTER(!!-?x) }",
+        ] {
+            parse(query.into()).unwrap();
+        }
+        let query = parse("ASK { FILTER(!(-?x)) }".into()).unwrap();
+        parse(query.to_string()).unwrap();
+    }
+
+    #[test]
+    fn wide_queries_are_bounded() {
+        // parsed on the test thread's own stack
+        let parse = |query: String| {
+            SparqlParser::new()
+                .parse_query(&query)
+                .map_err(|e| e.to_string())
+        };
+        // a path of 450 steps for each of 450 objects is 202,500 patterns
+        let paths = format!(
+            "SELECT * WHERE {{ ?s {} ?o{} }}",
+            ["<http://e/p>*"; 450].join("/"),
+            ", ?o".repeat(449)
+        );
+        assert!(parse(paths).unwrap_err().contains(TOO_DEEP));
+        let blocks = format!(
+            "SELECT * WHERE {{ {} }}",
+            "?s <http://e/p>* ?o . ".repeat(600)
+        );
+        assert!(parse(blocks).unwrap_err().contains(TOO_DEEP));
+        // the optimizer binds each ORDER BY condition that is not a variable
+        let order = |n: usize| parse(format!("SELECT * {{}} ORDER BY{}", "(1)".repeat(n)));
+        order(500).unwrap();
+        assert!(order(5_000).unwrap_err().contains(TOO_DEEP));
+        // the optimizer repeats the left side of IN for each item
+        let items = format!("{}1", "1, ".repeat(9_999));
+        parse(format!("ASK {{ FILTER(?x IN ({items})) }}")).unwrap();
+        let nested_in = format!(
+            "ASK {{ FILTER({}?x{}) }}",
+            "(".repeat(40),
+            " IN (1, 2))".repeat(40)
+        );
+        assert!(parse(nested_in).unwrap_err().contains(TOO_LARGE_IN));
+        let update = SparqlParser::new()
+            .parse_update(&format!(
+                "DELETE WHERE {{ GRAPH <http://e/g> {{ {} }} }}",
+                "?s ?p ?o . ".repeat(600)
+            ))
+            .unwrap_err();
+        assert!(update.to_string().contains(TOO_DEEP));
+    }
+
+    #[test]
+    fn a_syntax_error_past_the_nesting_limit_is_reported() {
+        let groups = format!(
+            "SELECT * WHERE {}{} LIMIT x",
+            "{".repeat(256),
+            "}".repeat(256)
+        );
+        let error = parse(groups).unwrap_err();
+        assert!(!error.contains(TOO_NESTED), "{error}");
     }
 }
