@@ -687,7 +687,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         Ok(result)
                     })
                     .collect::<Result<Vec<_>, QueryEvaluationError>>()?;
+                let cancellation_token = self.dataset.cancellation_token.clone();
                 Rc::new(move |from| {
+                    // A lateral join evaluates this once per tuple of its left side without reading the dataset
+                    if let Err(error) = cancellation_token.ensure_alive() {
+                        return Box::new(once(Err(error)));
+                    }
                     Box::new(
                         encoded_tuples
                             .iter()
@@ -1264,6 +1269,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 .iter()
                                 .map(|v| encode_variable(encoded_variables, v))
                                 .collect::<Vec<_>>();
+                            let cancellation_token = self.dataset.cancellation_token.clone();
                             Rc::new(move |from| {
                                 let mut errors = Vec::default();
                                 let mut built_values = InternalTupleSet::new(keys.clone());
@@ -1289,6 +1295,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                     probe_iter,
                                     built: built_values,
                                     buffered_results: errors,
+                                    cancellation_token: cancellation_token.clone(),
                                 })
                             })
                         }
@@ -1424,6 +1431,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             .iter()
                             .map(|v| encode_variable(encoded_variables, v))
                             .collect::<Vec<_>>();
+                        let cancellation_token = self.dataset.cancellation_token.clone();
                         Rc::new(move |from| {
                             let mut errors = Vec::default();
                             let mut right_values = InternalTupleSet::new(keys.clone());
@@ -1444,6 +1452,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 right: right_values,
                                 buffered_results: errors,
                                 expression: Rc::clone(&expression),
+                                cancellation_token: cancellation_token.clone(),
                             })
                         })
                     }
@@ -1695,7 +1704,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 Rc::new(move |from| {
                     let tuple_size = from.capacity();
                     let key_variables = Rc::clone(&key_variables);
-                    let mut errors = Vec::default();
+                    let mut error = None;
                     let mut accumulators_for_group = FxHashMap::<
                         Vec<Option<D::InternalTerm>>,
                         Vec<AccumulatorWrapper<'_, D::InternalTerm>>,
@@ -1707,11 +1716,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>(),
                         );
                     }
+                    // Stops at the first error: after a cancellation each remaining input tuple is one
                     child(from)
-                        .filter_map(|result| match result {
+                        .map_while(|result| match result {
                             Ok(result) => Some(result),
-                            Err(error) => {
-                                errors.push(error);
+                            Err(e) => {
+                                error = Some(e);
                                 None
                             }
                         })
@@ -1733,7 +1743,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     let accumulator_variables = accumulator_variables.clone();
                     let dataset = dataset.clone();
                     Box::new(
-                        errors
+                        error
                             .into_iter()
                             .map(Err)
                             .chain(accumulators_for_group.into_iter().map(
@@ -3812,6 +3822,7 @@ struct HashJoinIterator<'a, T> {
     probe_iter: Peekable<InternalTuplesIterator<'a, T>>,
     built: InternalTupleSet<T>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for HashJoinIterator<'_, T> {
@@ -3826,6 +3837,10 @@ impl<T: Clone + Eq + Hash> Iterator for HashJoinIterator<'_, T> {
                 Ok(probe_tuple) => probe_tuple,
                 Err(error) => return Some(Err(error)),
             };
+            // As in CartesianProductJoinIterator: joins of joins may never read the dataset
+            if let Err(error) = self.cancellation_token.ensure_alive() {
+                return Some(Err(error));
+            }
             self.buffered_results.extend(
                 self.built
                     .get(&probe_tuple)
@@ -3851,6 +3866,7 @@ struct HashLeftJoinIterator<'a, T> {
     right: InternalTupleSet<T>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
     expression: Rc<dyn Fn(&InternalTuple<T>) -> Option<bool> + 'a>,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
@@ -3865,6 +3881,10 @@ impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
                 Ok(left_tuple) => left_tuple,
                 Err(error) => return Some(Err(error)),
             };
+            // As in CartesianProductJoinIterator: joins of joins may never read the dataset
+            if let Err(error) = self.cancellation_token.ensure_alive() {
+                return Some(Err(error));
+            }
             self.buffered_results.extend(
                 self.right
                     .get(&left_tuple)
