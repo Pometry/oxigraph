@@ -1,15 +1,19 @@
 [package]
-name = "oxttl"
+name = "pometry-oxttl"
 version = "0.2.5"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["N-Triples", "N-Quads", "Turtle", "TriG", "N3"]
-repository = "https://github.com/oxigraph/oxigraph/tree/master/lib/oxttl"
-description = "Parser and serializer for languages related to RDF Turtle (N-Triples, N-Quads, Turtle, TriG and N3)"
-documentation = "https://docs.rs/oxttl"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+description = "Pometry's fork of oxigraph's oxttl: Parser and serializer for languages related to RDF Turtle (N-Triples, N-Quads, Turtle, TriG and N3)"
+documentation = "https://docs.rs/pometry-oxttl"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "oxttl"
 
 [features]
 default = []

@@ -1,17 +1,20 @@
 [package]
-name = "oxigraph"
+name = "pometry-oxigraph"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["RDF", "SPARQL", "graph-database", "database"]
 categories = ["database-implementations"]
-repository = "https://github.com/oxigraph/oxigraph/tree/main/lib/oxigraph"
-homepage = "https://oxigraph.org/"
-documentation = "https://docs.rs/oxigraph"
-description = "SPARQL database and RDF toolkit"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+documentation = "https://docs.rs/pometry-oxigraph"
+description = "Pometry's fork of oxigraph's oxigraph: SPARQL database and RDF toolkit"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "oxigraph"
 
 [features]
 default = ["rocksdb"]

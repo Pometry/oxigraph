@@ -1572,34 +1572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxigraph"
-version = "0.5.13"
-dependencies = [
- "bzip2",
- "codspeed-criterion-compat",
- "csv",
- "dashmap",
- "getrandom 0.3.4",
- "js-sys",
- "libc",
- "oxhttp",
- "oxiri",
- "oxrdf",
- "oxrdfio",
- "oxrocksdb-sys",
- "oxsdatatypes",
- "rand",
- "rustc-hash",
- "serde_json",
- "siphasher",
- "sparesults",
- "spareval",
- "spargebra",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "oxigraph-cli"
 version = "0.5.13"
 dependencies = [
@@ -1611,8 +1583,8 @@ dependencies = [
  "clap_mangen",
  "flate2",
  "oxhttp",
- "oxigraph",
  "oxiri",
+ "pometry-oxigraph",
  "predicates",
  "rand",
  "rayon-core",
@@ -1626,8 +1598,8 @@ version = "0.5.13"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
- "oxigraph",
- "oxrdfio",
+ "pometry-oxigraph",
+ "pometry-oxrdfio",
  "spargeo",
  "tokio",
  "wasm-bindgen",
@@ -1643,15 +1615,15 @@ dependencies = [
  "codspeed-criterion-compat",
  "dissimilar",
  "json-event-parser",
- "oxigraph",
  "oxiri",
  "oxjsonld",
  "oxrdf",
- "oxttl",
- "spareval",
- "spargebra",
+ "pometry-oxigraph",
+ "pometry-oxttl",
+ "pometry-spareval",
+ "pometry-spargebra",
+ "pometry-sparopt",
  "spargeo",
- "sparopt",
  "time",
 ]
 
@@ -1698,31 +1670,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxrdfio"
-version = "0.2.7"
-dependencies = [
- "oxjsonld",
- "oxrdf",
- "oxrdfxml",
- "oxttl",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "oxrdfxml"
-version = "0.2.5"
-dependencies = [
- "oxilangtag",
- "oxiri",
- "oxrdf",
- "quick-xml",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
 name = "oxrocksdb-sys"
 version = "0.5.13"
 dependencies = [
@@ -1737,20 +1684,6 @@ version = "0.2.4"
 dependencies = [
  "js-sys",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "oxttl"
-version = "0.2.5"
-dependencies = [
- "memchr",
- "oxilangtag",
- "oxiri",
- "oxrdf",
- "rayon",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]
@@ -1843,6 +1776,127 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "pometry-oxigraph"
+version = "0.5.13"
+dependencies = [
+ "bzip2",
+ "codspeed-criterion-compat",
+ "csv",
+ "dashmap",
+ "getrandom 0.3.4",
+ "js-sys",
+ "libc",
+ "oxhttp",
+ "oxiri",
+ "oxrdf",
+ "oxrocksdb-sys",
+ "oxsdatatypes",
+ "pometry-oxrdfio",
+ "pometry-sparesults",
+ "pometry-spareval",
+ "pometry-spargebra",
+ "rand",
+ "rustc-hash",
+ "serde_json",
+ "siphasher",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pometry-oxrdfio"
+version = "0.2.7"
+dependencies = [
+ "oxjsonld",
+ "oxrdf",
+ "pometry-oxrdfxml",
+ "pometry-oxttl",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "pometry-oxrdfxml"
+version = "0.2.5"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "quick-xml",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "pometry-oxttl"
+version = "0.2.5"
+dependencies = [
+ "memchr",
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "pometry-sparesults"
+version = "0.3.5"
+dependencies = [
+ "json-event-parser",
+ "memchr",
+ "oxrdf",
+ "quick-xml",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "pometry-spareval"
+version = "0.2.9"
+dependencies = [
+ "hex",
+ "json-event-parser",
+ "md-5",
+ "oxiri",
+ "oxrdf",
+ "oxsdatatypes",
+ "pometry-sparesults",
+ "pometry-spargebra",
+ "pometry-sparopt",
+ "rand",
+ "regex",
+ "rustc-hash",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pometry-spargebra"
+version = "0.4.8"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "peg",
+ "rand",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pometry-sparopt"
+version = "0.3.9"
+dependencies = [
+ "oxrdf",
+ "pometry-spargebra",
+ "rand",
 ]
 
 [[package]]
@@ -1985,7 +2039,7 @@ dependencies = [
 name = "pyoxigraph"
 version = "0.5.13"
 dependencies = [
- "oxigraph",
+ "pometry-oxigraph",
  "pyo3",
  "spargeo",
 ]
@@ -2503,51 +2557,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sparesults"
-version = "0.3.5"
-dependencies = [
- "json-event-parser",
- "memchr",
- "oxrdf",
- "quick-xml",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "spareval"
-version = "0.2.9"
-dependencies = [
- "hex",
- "json-event-parser",
- "md-5",
- "oxiri",
- "oxrdf",
- "oxsdatatypes",
- "rand",
- "regex",
- "rustc-hash",
- "sha1",
- "sha2",
- "sparesults",
- "spargebra",
- "sparopt",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "spargebra"
-version = "0.4.8"
-dependencies = [
- "oxilangtag",
- "oxiri",
- "oxrdf",
- "peg",
- "rand",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "spargeo"
 version = "0.5.7"
 dependencies = [
@@ -2555,15 +2564,6 @@ dependencies = [
  "geojson",
  "oxrdf",
  "wkt",
-]
-
-[[package]]
-name = "sparopt"
-version = "0.3.9"
-dependencies = [
- "oxrdf",
- "rand",
- "spargebra",
 ]
 
 [[package]]

@@ -1,15 +1,19 @@
 [package]
-name = "spargebra"
+name = "pometry-spargebra"
 version = "0.4.8"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["SPARQL"]
-repository = "https://github.com/oxigraph/oxigraph/tree/main/lib/spargebra"
-documentation = "https://docs.rs/spargebra"
-description = "SPARQL parser"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+documentation = "https://docs.rs/pometry-spargebra"
+description = "Pometry's fork of oxigraph's spargebra: SPARQL parser"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "spargebra"
 
 [features]
 default = []

@@ -490,7 +490,7 @@ jobs:
     strategy:
       matrix:
         build_args:
-          - "-p oxigraph --features http-client-native-tls"
+          - "-p pometry-oxigraph --features http-client-native-tls"
           - "-p oxigraph-testsuite"
     continue-on-error: true
     steps:

@@ -1,15 +1,19 @@
 [package]
-name = "sparesults"
+name = "pometry-sparesults"
 version = "0.3.5"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["SPARQL"]
-repository = "https://github.com/oxigraph/oxigraph/tree/main/lib/sparesults"
-description = "SPARQL query results formats parsers and serializers"
-documentation = "https://docs.rs/sparesults"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+description = "Pometry's fork of oxigraph's sparesults: SPARQL query results formats parsers and serializers"
+documentation = "https://docs.rs/pometry-sparesults"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "sparesults"
 
 [features]
 default = []

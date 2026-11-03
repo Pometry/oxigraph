@@ -1,15 +1,19 @@
 [package]
-name = "spareval"
+name = "pometry-spareval"
 version = "0.2.9"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["SPARQL"]
-repository = "https://github.com/oxigraph/oxigraph/tree/main/lib/spareval"
-documentation = "https://docs.rs/spareval"
-description = "SPARQL evaluator"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+documentation = "https://docs.rs/pometry-spareval"
+description = "Pometry's fork of oxigraph's spareval: SPARQL evaluator"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "spareval"
 
 [features]
 default = []

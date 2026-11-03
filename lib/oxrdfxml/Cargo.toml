@@ -1,15 +1,19 @@
 [package]
-name = "oxrdfxml"
+name = "pometry-oxrdfxml"
 version = "0.2.5"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["RDFXML", "XML", "RDF"]
-repository = "https://github.com/oxigraph/oxigraph/tree/master/lib/oxrdfxml"
-description = "Parser and serializer for the RDF/XML format"
-documentation = "https://docs.rs/oxrdfxml"
+repository = "https://github.com/Pometry/oxigraph"
+homepage = "https://github.com/Pometry/oxigraph"
+description = "Pometry's fork of oxigraph's oxrdfxml: Parser and serializer for the RDF/XML format"
+documentation = "https://docs.rs/pometry-oxrdfxml"
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "oxrdfxml"
 
 [features]
 default = []
